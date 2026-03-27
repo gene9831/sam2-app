@@ -20,18 +20,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
-from sam2_segment import CHECKPOINT, MODEL_CFG, REPO_ROOT, run_segmentation_with_predictor
+from sam2_config import CHECKPOINT, MODEL_CFG, REPO_ROOT, default_segment_device
+from sam2_segment import run_segmentation_with_predictor
 
 _predictor = None
 _device: str | None = None
-
-
-def _select_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def load_model() -> None:
@@ -46,7 +39,7 @@ def load_model() -> None:
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    device = _select_device()
+    device = default_segment_device()
     model = build_sam2(
         MODEL_CFG,
         str(CHECKPOINT),
@@ -147,6 +140,9 @@ async def segment(
     Run segmentation. Points and box are in pixel coordinates: x horizontal, y vertical, origin top-left.
 
     At least one of foreground_points, background_points, or box_xyxy must be provided.
+
+    If box_xyxy is included in the JSON, the returned pixel mask is cropped to the box: pixels outside
+    the box are forced to background (SAM may still predict leakage outside the rectangle).
     """
     data = _parse_prompts_json(prompts_json)
     if data.get("use_default_prompts"):

@@ -1,39 +1,14 @@
 #!/usr/bin/env python3
 """
-Segment a subject using SAM 2 with optional box + foreground / background point prompts.
+SAM 2 image segmentation pipeline: build prompts, run predictor, mask post-process.
 
-Foreground points (label 1): include this area in the mask.
-Background points (label 0): exclude this area from the mask.
-
-Coordinates are in pixel space (x, y) of the original image, matching SAM2ImagePredictor.
-
-Examples:
-  # Box only
-  python sam2_segment.py -i photo.png --box 10,20,400,500
-
-  # Custom points (pixels); foreground first, then background
-  python sam2_segment.py -i photo.png \\
-    --fg 180,220 --fg 200,380 \\
-    --bg 520,180 --bg 540,400
-
-  # Points only, no box
-  python sam2_segment.py --no-box --fg 200,300 --bg 550,250
+Entry points: HTTP (`app.py`) and CLI (`cli.py`).
 """
 
 from __future__ import annotations
 
-import argparse
-import os
-import sys
-from pathlib import Path
-
 import numpy as np
 import torch
-from PIL import Image
-
-REPO_ROOT = Path(__file__).resolve().parent / "facebook-sam2"
-CHECKPOINT = REPO_ROOT / "checkpoints" / "sam2.1_hiera_base_plus.pt"
-MODEL_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 
 
 def overlay_mask(
@@ -47,20 +22,52 @@ def overlay_mask(
     return np.clip(out * 255.0, 0, 255).astype(np.uint8)
 
 
-def parse_xy_pair(spec: str) -> tuple[float, float]:
-    """Parse 'x,y' or 'x, y' into floats."""
-    parts = spec.replace(" ", "").split(",")
-    if len(parts) != 2:
-        raise argparse.ArgumentTypeError(f"Expected 'x,y', got: {spec!r}")
-    return float(parts[0]), float(parts[1])
+def clip_mask_to_xyxy_box(
+    mask: np.ndarray,
+    box_xyxy: tuple[float, float, float, float] | np.ndarray,
+) -> np.ndarray:
+    """
+    Binary mask (H, W): force mask==0 for every pixel outside the XYXY rectangle (pixel coords).
+    Model output may extend past the box; callers keep only the intersection with the box interior.
+    """
+    h, w = mask.shape[:2]
+    if isinstance(box_xyxy, np.ndarray):
+        x1, y1, x2, y2 = (float(t) for t in box_xyxy.ravel())
+    else:
+        x1, y1, x2, y2 = (float(t) for t in box_xyxy)
+
+    x1i = max(0, min(w, int(np.floor(min(x1, x2)))))
+    y1i = max(0, min(h, int(np.floor(min(y1, y2)))))
+    x2i = max(0, min(w, int(np.ceil(max(x1, x2)))))
+    y2i = max(0, min(h, int(np.ceil(max(y1, y2)))))
+
+    if x2i <= x1i or y2i <= y1i:
+        return np.zeros_like(mask)
+
+    out = mask.copy()
+    if y1i > 0:
+        out[:y1i, :] = 0
+    if y2i < h:
+        out[y2i:, :] = 0
+    if x1i > 0:
+        out[:, :x1i] = 0
+    if x2i < w:
+        out[:, x2i:] = 0
+    return out
 
 
-def parse_xyxy_box(spec: str) -> np.ndarray:
-    """Parse 'x1,y1,x2,y2' into float32 XYXY."""
-    parts = spec.replace(" ", "").split(",")
-    if len(parts) != 4:
-        raise argparse.ArgumentTypeError(f"Expected 'x1,y1,x2,y2', got: {spec!r}")
-    return np.array([float(p) for p in parts], dtype=np.float32)
+def finalize_binary_mask_and_overlay(
+    raw_mask: np.ndarray,
+    image_rgb: np.ndarray,
+    box_xyxy: tuple[float, float, float, float] | np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Optional clip to XYXY box, then build RGB overlay. Single entry point for API + CLI.
+    """
+    mask = raw_mask.astype(np.uint8)
+    if box_xyxy is not None:
+        mask = clip_mask_to_xyxy_box(mask, box_xyxy)
+    return mask, overlay_mask(image_rgb, mask)
 
 
 def prepare_prompts(
@@ -75,7 +82,7 @@ def prepare_prompts(
     """
     Build box / point prompts for SAM2ImagePredictor.predict().
 
-    Returns (box_xyxy_or_none, point_coords_or_none, point_labels_or_none).
+    Returns (box_array_or_none, point_coords_or_none, point_labels_or_none).
     Point arrays may be None for box-only segmentation.
     """
     fg = list(foreground_points or [])
@@ -114,61 +121,6 @@ def prepare_prompts(
     return box_arr, point_coords, point_labels
 
 
-def build_prompts_from_cli(
-    fg_specs: list[str] | None,
-    bg_specs: list[str] | None,
-    box_spec: str | None,
-    no_box: bool,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None] | None:
-    """
-    Returns None if there are no --fg/--bg (caller may still use --box only).
-    Otherwise returns (box_xyxy_or_none, point_coords, point_labels).
-    """
-    use_custom_points = fg_specs is not None or bg_specs is not None
-    if not use_custom_points:
-        return None
-
-    fg_list = fg_specs or []
-    bg_list = bg_specs or []
-    coords: list[list[float]] = []
-    labels: list[int] = []
-    for s in fg_list:
-        x, y = parse_xy_pair(s)
-        coords.append([x, y])
-        labels.append(1)
-    for s in bg_list:
-        x, y = parse_xy_pair(s)
-        coords.append([x, y])
-        labels.append(0)
-
-    if len(coords) == 0:
-        raise SystemExit("With --fg/--bg, provide at least one --fg or one --bg.")
-    # Only background points: still allowed if box is given
-    if not any(labels) and no_box and box_spec is None:
-        raise SystemExit(
-            "Only background points require a box. Use --box or add at least one --fg, or remove --no-box."
-        )
-
-    point_coords = np.array(coords, dtype=np.float32)
-    point_labels = np.array(labels, dtype=np.int32)
-
-    if no_box:
-        box_xyxy = None
-    elif box_spec:
-        box_xyxy = parse_xyxy_box(box_spec)
-    else:
-        raise SystemExit(
-            "With --fg/--bg, add --box X1,Y1,X2,Y2 or use --no-box for point-only prompts."
-        )
-
-    if not any(labels) and box_xyxy is None:
-        raise SystemExit(
-            "Only background points require a box. Use --box or add at least one --fg."
-        )
-
-    return box_xyxy, point_coords, point_labels
-
-
 def run_segmentation_with_predictor(
     predictor,
     image_np: np.ndarray,
@@ -180,7 +132,8 @@ def run_segmentation_with_predictor(
     no_box: bool = False,
 ) -> tuple[np.ndarray, float, np.ndarray]:
     """
-    Run SAM 2 on an RGB uint8 image (H, W, 3). Returns (binary mask HxW, iou score, RGB overlay HxWx3).
+    Run SAM 2 on an RGB uint8 image (H, W, 3).
+    Returns (binary mask HxW, iou score, RGB overlay HxWx3).
     """
     h, w = image_np.shape[:2]
     box_arr, point_coords, point_labels = prepare_prompts(
@@ -211,158 +164,5 @@ def run_segmentation_with_predictor(
             normalize_coords=True,
         )
 
-    mask = masks[0].astype(np.uint8)
-    overlay = overlay_mask(image_np, mask)
+    mask, overlay = finalize_binary_mask_and_overlay(masks[0], image_np, box_xyxy)
     return mask, float(scores[0]), overlay
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="SAM 2 segmentation with optional box, foreground and background points."
-    )
-    parser.add_argument(
-        "-i",
-        "--input",
-        type=Path,
-        required=True,
-        help="Input RGB image path",
-    )
-    parser.add_argument(
-        "--fg",
-        dest="fg_points",
-        action="append",
-        default=None,
-        metavar="X,Y",
-        help="Foreground point (include); repeatable. Pixel coordinates.",
-    )
-    parser.add_argument(
-        "--bg",
-        dest="bg_points",
-        action="append",
-        default=None,
-        metavar="X,Y",
-        help="Background point (exclude); repeatable. Pixel coordinates.",
-    )
-    parser.add_argument(
-        "--box",
-        type=str,
-        default=None,
-        metavar="X1,Y1,X2,Y2",
-        help="Optional box prompt in XYXY pixel coords (required with --fg/--bg unless --no-box).",
-    )
-    parser.add_argument(
-        "--no-box",
-        action="store_true",
-        help="Do not pass a box prompt (points only).",
-    )
-    parser.add_argument(
-        "-o",
-        "--output-prefix",
-        type=Path,
-        default=None,
-        help="Prefix for outputs (default: stem of input -> stem_person_mask*.png)",
-    )
-    args = parser.parse_args()
-
-    img_path = args.input.expanduser().resolve()
-    if not img_path.is_file():
-        print(f"Image not found: {img_path}", file=sys.stderr)
-        return 1
-    if not CHECKPOINT.is_file():
-        print(f"Checkpoint not found: {CHECKPOINT}", file=sys.stderr)
-        return 1
-
-    if args.output_prefix is not None:
-        stem = args.output_prefix.expanduser().resolve()
-        out_path = Path(str(stem) + "_mask_overlay.png")
-        mask_path = Path(str(stem) + "_mask.png")
-    else:
-        stem = img_path.stem
-        parent = img_path.parent
-        out_path = parent / f"{stem}_person_mask_overlay.png"
-        mask_path = parent / f"{stem}_person_mask.png"
-
-    # Absolute paths before os.chdir(REPO_ROOT), which breaks relative save paths.
-    out_path = out_path.resolve()
-    mask_path = mask_path.resolve()
-
-    pil = Image.open(img_path).convert("RGB")
-    w, h = pil.size
-    image_np = np.array(pil)
-
-    prompts = build_prompts_from_cli(
-        args.fg_points,
-        args.bg_points,
-        args.box,
-        args.no_box,
-    )
-
-    if prompts is None:
-        if args.box and not args.no_box:
-            box_xyxy = parse_xyxy_box(args.box)
-            point_coords = None
-            point_labels = None
-        else:
-            print(
-                "Provide --fg / --bg and/or --box (use --no-box with points only, no box).",
-                file=sys.stderr,
-            )
-            return 1
-    else:
-        box_xyxy, point_coords, point_labels = prompts
-
-    os.chdir(REPO_ROOT)
-
-    from sam2.build_sam import build_sam2
-    from sam2.sam2_image_predictor import SAM2ImagePredictor
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    model = build_sam2(
-        MODEL_CFG,
-        str(CHECKPOINT),
-        device=device,
-        apply_postprocessing=False,
-    )
-    predictor = SAM2ImagePredictor(model)
-
-    with torch.inference_mode():
-        if device == "mps":
-            autocast_device, autocast_dtype = "mps", torch.bfloat16
-        elif device == "cuda":
-            autocast_device, autocast_dtype = "cuda", torch.bfloat16
-        else:
-            autocast_device, autocast_dtype = "cpu", torch.float32
-
-        with torch.autocast(autocast_device, dtype=autocast_dtype, enabled=device != "cpu"):
-            predictor.set_image(image_np)
-            masks, scores, _ = predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_labels,
-                box=box_xyxy,
-                multimask_output=False,
-                normalize_coords=True,
-            )
-
-    best = masks[0].astype(np.uint8)
-    overlay = overlay_mask(image_np, best)
-
-    Image.fromarray(overlay).save(out_path)
-    Image.fromarray((best * 255).astype(np.uint8), mode="L").save(mask_path)
-
-    if point_labels is not None:
-        n_fg = int(np.sum(point_labels == 1))
-        n_bg = int(np.sum(point_labels == 0))
-    else:
-        n_fg = n_bg = 0
-    print(
-        f"device={device} points_fg={n_fg} points_bg={n_bg} "
-        f"box={'yes' if box_xyxy is not None else 'no'} "
-        f"mask_shape={best.shape} score={float(scores[0]):.4f}"
-    )
-    print(f"wrote {out_path}")
-    print(f"wrote {mask_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

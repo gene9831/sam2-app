@@ -4,12 +4,14 @@ Local toolkit and web UI around [SAM 2](https://github.com/facebookresearch/sam2
 
 ## Repository layout
 
-| Path              | Purpose                                                                                                    |
-| ----------------- | ---------------------------------------------------------------------------------------------------------- |
-| `facebook-sam2/`  | Git submodule → [facebookresearch/sam2](https://github.com/facebookresearch/sam2) (model code and config). |
-| `app.py`          | FastAPI app: loads the model once, exposes `/health` and `/segment`.                                       |
-| `sam2_segment.py` | Segmentation helpers and CLI (`REPO_ROOT` points at `facebook-sam2`).                                      |
-| `web/`            | Vite + Vue frontend; dev server proxies `/api` to the backend.                                             |
+| Path              | Purpose                                                                                                               |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `facebook-sam2/`  | Git submodule → [facebookresearch/sam2](https://github.com/facebookresearch/sam2) (model code and config).            |
+| `app.py`          | **HTTP entry:** FastAPI app; loads the model once; `/health` and `/segment`.                                          |
+| `cli.py`          | **CLI entry:** argparse, builds prompts, runs the same segmentation path stack as the API.                            |
+| `sam2_segment.py` | Core segmentation flow (`run_segmentation_with_predictor`), mask clip/overlay helpers; used by `app.py` and `cli.py`. |
+| `sam2_config.py`  | Repo paths (`REPO_ROOT` → `facebook-sam2`), checkpoint path, model YAML, and default device.                          |
+| `web/`            | Vite + Vue frontend; dev server proxies `/api` to the backend.                                                        |
 
 ## Prerequisites
 
@@ -46,7 +48,7 @@ pip install -r requirements-api.txt
 
 ## Model checkpoint
 
-The API expects this file (see `sam2_segment.py`):
+The API expects this file (see `sam2_config.py`):
 
 `facebook-sam2/checkpoints/sam2.1_hiera_base_plus.pt`
 
@@ -96,10 +98,10 @@ The Vite dev server maps `/api/*` to `http://127.0.0.1:8000/*`, so keep the API 
 For quick tests without the HTTP API:
 
 ```bash
-python sam2_segment.py -i path/to/image.png --fg 200,300 --bg 500,400
+python cli.py -i path/to/image.png --fg 200,300 --bg 500,400
 ```
 
-Use `python sam2_segment.py --help` for box/CJK and `--no-box` options.
+Use `python cli.py --help` for box/CJK and `--no-box` options.
 
 ## License
 

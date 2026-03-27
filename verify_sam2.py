@@ -3,14 +3,10 @@
 
 import os
 import sys
-from pathlib import Path
 
 import torch
 
-# SAM2 Hydra resolves configs relative to the cloned repo root
-REPO_ROOT = Path(__file__).resolve().parent / "facebook-sam2"
-CHECKPOINT = REPO_ROOT / "checkpoints" / "sam2.1_hiera_base_plus.pt"
-MODEL_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+from sam2_config import CHECKPOINT, MODEL_CFG, REPO_ROOT
 
 
 def main() -> int:

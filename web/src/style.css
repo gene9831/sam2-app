@@ -323,7 +323,30 @@ body {
 
 .panel-stage .canvas-hold {
   width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   justify-content: center;
+}
+
+/*
+ * Shared zoom/pan for Source + Segmentation (same transform from Source Cmd/Ctrl+wheel).
+ * Segmentation has no wheel zoom — only mirrors shared state.
+ */
+.paired-zoom-viewport {
+  position: relative;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+}
+
+.paired-zoom-flexer {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: top;
 }
 
 /* Shared header strip for Source / Segmentation so title rows share the same height */
@@ -470,6 +493,10 @@ body {
   outline: 1px solid var(--border);
   border-radius: 4px;
   background: repeating-conic-gradient(var(--border) 0% 25%, var(--surface) 0% 50%) 50% / 14px 14px;
+}
+
+.panel-segmentation .segmentation-visual > .paired-zoom-viewport {
+  align-self: stretch;
 }
 
 .panel-segmentation .segmentation-visual > .result-placeholder {
